@@ -27,8 +27,11 @@ The development backend creates demo accounts on startup:
 - `hr_manager` / `hr123`
 - `admin` / `admin123`
 
-Change these credentials and configure a strong `SECRET_KEY` before exposing
-the backend outside a local development environment.
+For production, set `APP_ENV=production`, a random `SECRET_KEY` of at least 32
+characters, and `BOOTSTRAP_ADMIN_USERNAME`, `BOOTSTRAP_ADMIN_EMAIL`, and a
+`BOOTSTRAP_ADMIN_PASSWORD` of at least 12 characters for the first startup.
+The bootstrap credentials are ignored after an admin exists. Production does
+not create the development demo accounts.
 
 ## Checks
 

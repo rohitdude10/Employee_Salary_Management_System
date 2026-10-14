@@ -1,8 +1,10 @@
 import base64
+import binascii
 import hashlib
 import hmac
 import json
 import os
+import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -12,7 +14,13 @@ from sqlalchemy.orm import Session
 from app.database import get_db
 from app.models.user import User
 
-SECRET_KEY = os.getenv("SECRET_KEY", "acme-dev-secret-key")
+APP_ENV = os.getenv("APP_ENV", "development").strip().lower()
+configured_secret = os.getenv("SECRET_KEY")
+if APP_ENV == "production" and (
+    not configured_secret or len(configured_secret) < 32
+):
+    raise RuntimeError("Production requires a SECRET_KEY of at least 32 characters")
+SECRET_KEY = configured_secret or secrets.token_urlsafe(32)
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24
 
@@ -64,18 +72,36 @@ def create_access_token(subject: str, role: str) -> str:
 def decode_access_token(token: str) -> dict[str, Any]:
     try:
         header_b64, payload_b64, signature = token.split(".")
-    except ValueError as exc:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token format") from exc
+        header = json.loads(_b64url_decode(header_b64).decode("utf-8"))
+        payload = json.loads(_b64url_decode(payload_b64).decode("utf-8"))
+    except (ValueError, TypeError, UnicodeDecodeError, binascii.Error) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid token",
+        ) from exc
+
+    if not isinstance(header, dict) or header.get("alg") != ALGORITHM:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
 
     expected_sig = _b64url_encode(
-        hmac.new(SECRET_KEY.encode("utf-8"), f"{header_b64}.{payload_b64}".encode(), hashlib.sha256).digest()
+        hmac.new(
+            SECRET_KEY.encode("utf-8"),
+            f"{header_b64}.{payload_b64}".encode(),
+            hashlib.sha256,
+        ).digest()
     )
     if not hmac.compare_digest(signature, expected_sig):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token signature")
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
 
-    payload = json.loads(_b64url_decode(payload_b64).decode("utf-8"))
+    subject = payload.get("sub")
     exp = payload.get("exp")
-    if exp is None or datetime.now(timezone.utc).timestamp() > int(exp):
+    if not isinstance(subject, str) or not subject:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
+    if not isinstance(exp, int) or isinstance(exp, bool):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
+    if datetime.now(timezone.utc).timestamp() > exp:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token has expired")
     return payload
 
@@ -88,6 +114,11 @@ def get_current_user(
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing or invalid authorization header")
 
     token = authorization.split(" ", 1)[1].strip()
+    if not token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing or invalid authorization header",
+        )
     payload = decode_access_token(token)
     username = payload.get("sub")
     if not username:

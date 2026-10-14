@@ -11,13 +11,38 @@ from app.api.routes.auth import router as auth_router
 from app.api.routes.employees import router as employees_router
 from app.api.routes.salary import router as salary_router
 from app.database import Base, SessionLocal, engine
-from app.core.security import hash_password
+from app.core.security import APP_ENV, hash_password
 from app.models.user import User
 
 
 def ensure_default_users() -> None:
     db: Session = SessionLocal()
     try:
+        if APP_ENV == "production":
+            if db.query(User).filter(User.role == "admin").first():
+                return
+
+            username = os.getenv("BOOTSTRAP_ADMIN_USERNAME")
+            email = os.getenv("BOOTSTRAP_ADMIN_EMAIL")
+            password = os.getenv("BOOTSTRAP_ADMIN_PASSWORD")
+            if not username or not email or not password or len(password) < 12:
+                raise RuntimeError(
+                    "Production requires BOOTSTRAP_ADMIN_USERNAME, "
+                    "BOOTSTRAP_ADMIN_EMAIL, and a BOOTSTRAP_ADMIN_PASSWORD "
+                    "of at least 12 characters until an admin exists"
+                )
+
+            db.add(
+                User(
+                    username=username,
+                    email=email,
+                    password_hash=hash_password(password),
+                    role="admin",
+                )
+            )
+            db.commit()
+            return
+
         if not db.query(User).filter(User.username == "admin").first():
             db.add(
                 User(

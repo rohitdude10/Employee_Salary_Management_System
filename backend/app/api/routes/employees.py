@@ -2,8 +2,11 @@ import csv
 import io
 from datetime import date, timedelta
 from decimal import Decimal
+from pydantic import ValidationError
+from sqlalchemy.exc import IntegrityError
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Response, UploadFile, status
+from fastapi.encoders import jsonable_encoder
 from sqlalchemy import or_, select, func
 from sqlalchemy.orm import Session
 
@@ -18,13 +21,13 @@ from app.schemas.employee import EmployeeCreate, EmployeeOut, EmployeeUpdate
 router = APIRouter()
 
 
-def _serialize_employee(employee: Employee, db: Session) -> EmployeeOut:
-    latest_salary = (
-        db.query(SalaryRecord)
-        .filter(SalaryRecord.employee_id == employee.id)
-        .order_by(SalaryRecord.effective_from.desc(), SalaryRecord.created_at.desc())
-        .first()
-    )
+MAX_CSV_BYTES = 5 * 1024 * 1024
+
+
+def _serialize_employee(
+    employee: Employee,
+    latest_salary: SalaryRecord | None = None,
+) -> EmployeeOut:
     return EmployeeOut(
         id=employee.id,
         employee_code=employee.employee_code,
@@ -65,7 +68,6 @@ def list_employees(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_roles("hr_manager", "admin")),
 ):
-    statement = select(Employee)
     count_statement = select(func.count(Employee.id))
     filters = []
 
@@ -91,15 +93,32 @@ def list_employees(
         filters.append(Employee.status == status)
 
     if filters:
-        statement = statement.where(*filters)
         count_statement = count_statement.where(*filters)
 
     total = db.scalar(count_statement) or 0
     offset = (page - 1) * size
-    rows = db.scalars(statement.order_by(Employee.id).offset(offset).limit(size)).all()
+    latest_salary_id = (
+        select(SalaryRecord.id)
+        .where(SalaryRecord.employee_id == Employee.id)
+        .order_by(SalaryRecord.effective_from.desc(), SalaryRecord.created_at.desc())
+        .limit(1)
+        .correlate(Employee)
+        .scalar_subquery()
+    )
+    rows = db.execute(
+        select(Employee, SalaryRecord)
+        .outerjoin(SalaryRecord, SalaryRecord.id == latest_salary_id)
+        .where(*filters)
+        .order_by(Employee.id)
+        .offset(offset)
+        .limit(size)
+    ).all()
 
     payload = {
-        "items": [_serialize_employee(employee, db).model_dump() for employee in rows],
+        "items": [
+            _serialize_employee(employee, salary).model_dump()
+            for employee, salary in rows
+        ],
         "total": total,
         "page": page,
         "size": size,
@@ -125,7 +144,10 @@ def get_employee(
         .all()
     )
     return {
-        "employee": _serialize_employee(employee, db).model_dump(),
+        "employee": _serialize_employee(
+            employee,
+            salary_history[0] if salary_history else None,
+        ).model_dump(),
         "salary_history": [
             {
                 "id": record.id,
@@ -184,8 +206,6 @@ def create_employee(
         )
         db.add(salary_record)
 
-    db.commit()
-    db.refresh(employee)
     _log_audit(
         db,
         user_id=current_user.id,
@@ -195,8 +215,22 @@ def create_employee(
         details={"employee_code": employee.employee_code, "status": employee.status},
         summary=f"Created employee {employee.employee_code}",
     )
-    db.commit()
-    return _serialize_employee(employee, db)
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Employee code or email already exists",
+        ) from exc
+    db.refresh(employee)
+    current_salary = (
+        db.query(SalaryRecord)
+        .filter(SalaryRecord.employee_id == employee.id)
+        .order_by(SalaryRecord.effective_from.desc(), SalaryRecord.created_at.desc())
+        .first()
+    )
+    return _serialize_employee(employee, current_salary)
 
 
 @router.put("/{employee_id:int}", response_model=EmployeeOut)
@@ -222,7 +256,23 @@ def update_employee(
         "status": employee.status,
     }
 
-    for field, value in payload.model_dump(exclude_unset=True).items():
+    updates = payload.model_dump(exclude_unset=True)
+    if updates.get("hire_date") is not None:
+        existing_salary = db.scalar(
+            select(SalaryRecord.id)
+            .where(
+                SalaryRecord.employee_id == employee_id,
+                SalaryRecord.effective_from < updates["hire_date"],
+            )
+            .limit(1)
+        )
+        if existing_salary:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Hire date cannot be later than an existing salary effective date",
+            )
+
+    for field, value in updates.items():
         if field == "employee_code" and value is not None and value != employee.employee_code:
             existing = db.query(Employee).filter(Employee.employee_code == value).first()
             if existing and existing.id != employee_id:
@@ -233,19 +283,39 @@ def update_employee(
                 raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Email already exists")
         setattr(employee, field, value)
 
-    db.commit()
-    db.refresh(employee)
     _log_audit(
         db,
         user_id=current_user.id,
         employee_id=employee.id,
         salary_record_id=None,
         action="employee_updated",
-        details={"before": old_values, "after": _serialize_employee(employee, db).model_dump()},
+        details=jsonable_encoder(
+            {
+                "before": old_values,
+                "after": {
+                    field: getattr(employee, field)
+                    for field in old_values
+                },
+            }
+        ),
         summary=f"Updated employee {employee.employee_code}",
     )
-    db.commit()
-    return _serialize_employee(employee, db)
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Employee code or email already exists",
+        ) from exc
+    db.refresh(employee)
+    current_salary = (
+        db.query(SalaryRecord)
+        .filter(SalaryRecord.employee_id == employee.id)
+        .order_by(SalaryRecord.effective_from.desc(), SalaryRecord.created_at.desc())
+        .first()
+    )
+    return _serialize_employee(employee, current_salary)
 
 
 @router.delete("/{employee_id:int}")
@@ -258,15 +328,19 @@ def deactivate_employee(
     if not employee:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Employee not found")
 
+    previous_status = employee.status
     employee.status = "inactive"
-    db.commit()
     _log_audit(
         db,
         user_id=current_user.id,
         employee_id=employee.id,
         salary_record_id=None,
         action="employee_deactivated",
-        details={"employee_code": employee.employee_code},
+        details={
+            "employee_code": employee.employee_code,
+            "before": {"status": previous_status},
+            "after": {"status": employee.status},
+        },
         summary=f"Deactivated employee {employee.employee_code}",
     )
     db.commit()
@@ -283,10 +357,10 @@ def export_employees_csv(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_roles("hr_manager", "admin")),
 ):
-    statement = select(Employee)
+    filters = []
     if search:
         term = f"%{search.strip()}%"
-        statement = statement.where(
+        filters.append(
             or_(
                 Employee.first_name.ilike(term),
                 Employee.last_name.ilike(term),
@@ -297,15 +371,28 @@ def export_employees_csv(
             )
         )
     if country:
-        statement = statement.where(Employee.country == country)
+        filters.append(Employee.country == country)
     if department:
-        statement = statement.where(Employee.department == department)
+        filters.append(Employee.department == department)
     if job_title:
-        statement = statement.where(Employee.job_title == job_title)
+        filters.append(Employee.job_title == job_title)
     if status:
-        statement = statement.where(Employee.status == status)
+        filters.append(Employee.status == status)
 
-    employees = db.scalars(statement.order_by(Employee.id)).all()
+    latest_salary_id = (
+        select(SalaryRecord.id)
+        .where(SalaryRecord.employee_id == Employee.id)
+        .order_by(SalaryRecord.effective_from.desc(), SalaryRecord.created_at.desc())
+        .limit(1)
+        .correlate(Employee)
+        .scalar_subquery()
+    )
+    employees = db.execute(
+        select(Employee, SalaryRecord)
+        .outerjoin(SalaryRecord, SalaryRecord.id == latest_salary_id)
+        .where(*filters)
+        .order_by(Employee.id)
+    ).all()
     output = io.StringIO()
     writer = csv.writer(output)
     writer.writerow([
@@ -322,13 +409,7 @@ def export_employees_csv(
         "current_salary",
         "current_currency",
     ])
-    for employee in employees:
-        latest_salary = (
-            db.query(SalaryRecord)
-            .filter(SalaryRecord.employee_id == employee.id)
-            .order_by(SalaryRecord.effective_from.desc(), SalaryRecord.created_at.desc())
-            .first()
-        )
+    for employee, latest_salary in employees:
         writer.writerow([
             employee.id,
             employee.employee_code,
@@ -357,74 +438,253 @@ def import_employees_csv(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_roles("hr_manager", "admin")),
 ):
-    content = file.file.read().decode("utf-8-sig")
+    content_bytes = file.file.read(MAX_CSV_BYTES + 1)
+    if len(content_bytes) > MAX_CSV_BYTES:
+        raise HTTPException(
+            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+            detail=f"CSV file exceeds the {MAX_CSV_BYTES // (1024 * 1024)} MB limit",
+        )
+    try:
+        content = content_bytes.decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="CSV file must use UTF-8 encoding",
+        ) from exc
+
     reader = csv.DictReader(io.StringIO(content))
-    fieldnames = set(reader.fieldnames or [])
-    required = {"employee_code", "first_name", "last_name", "email", "country", "department", "job_title", "hire_date"}
+    if not reader.fieldnames:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="CSV file must include a header row",
+        )
+
+    normalized_headers = [name.strip() for name in reader.fieldnames]
+    if len(normalized_headers) != len(set(normalized_headers)):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="CSV file contains duplicate column names",
+        )
+    reader.fieldnames = normalized_headers
+    fieldnames = set(normalized_headers)
+    required = {
+        "employee_code",
+        "first_name",
+        "last_name",
+        "email",
+        "country",
+        "department",
+        "job_title",
+        "hire_date",
+    }
     missing = required - fieldnames
     if missing:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Missing required columns: {sorted(missing)}")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Missing required columns: {sorted(missing)}",
+        )
 
-    inserted = 0
-    updated = 0
-    errors = []
+    staged_rows = []
+    seen_codes: set[str] = set()
+    seen_emails: set[str] = set()
+    errors: list[dict[str, object]] = []
+    for row_number, row in enumerate(reader, start=2):
+        if not any(value and value.strip() for value in row.values() if isinstance(value, str)):
+            continue
+        if None in row:
+            errors.append({"row": row_number, "error": "Row has more values than the header"})
+            continue
 
-    for row in reader:
         try:
-            payload = {
-                "employee_code": (row.get("employee_code") or "").strip(),
-                "first_name": (row.get("first_name") or "").strip(),
-                "last_name": (row.get("last_name") or "").strip(),
-                "email": (row.get("email") or "").strip(),
-                "country": (row.get("country") or "").strip(),
-                "department": (row.get("department") or "").strip(),
-                "job_title": (row.get("job_title") or "").strip(),
-                "hire_date": date.fromisoformat((row.get("hire_date") or "").strip()),
-                "status": (row.get("status") or "active").strip() or "active",
+            row_data: dict[str, object] = {
+                key: (value or "").strip()
+                for key, value in row.items()
+                if key is not None
             }
-            if not all(payload.values()):
-                raise ValueError("One or more required fields are empty")
+            if not row_data.get("status"):
+                row_data["status"] = "active"
+            salary_amount = row_data.get("salary_amount")
+            if not salary_amount:
+                for key in (
+                    "salary_amount",
+                    "salary_currency",
+                    "salary_pay_frequency",
+                    "salary_effective_from",
+                ):
+                    row_data.pop(key, None)
+            elif not row_data.get("salary_currency"):
+                row_data["salary_currency"] = "USD"
 
-            employee = db.query(Employee).filter(Employee.employee_code == payload["employee_code"]).first()
-            if employee:
-                for key, value in payload.items():
-                    setattr(employee, key, value)
-                updated += 1
-            else:
-                employee = Employee(**payload)
-                db.add(employee)
-                db.flush()
-                inserted += 1
-
-            salary_amount = (row.get("salary_amount") or "").strip()
-            if salary_amount:
-                salary_currency = (row.get("salary_currency") or "USD").strip() or "USD"
-                pay_frequency = (row.get("salary_pay_frequency") or "annual").strip() or "annual"
-                salary_effective_from = row.get("salary_effective_from")
-                effective_from = date.fromisoformat(salary_effective_from.strip()) if salary_effective_from else payload["hire_date"]
-                salary = SalaryRecord(
-                    employee_id=employee.id,
-                    amount=Decimal(salary_amount),
-                    currency=salary_currency,
-                    pay_frequency=pay_frequency,
-                    effective_from=effective_from,
+            payload = EmployeeCreate.model_validate(row_data)
+            effective_from = payload.salary_effective_from or payload.hire_date
+            if payload.salary_amount is not None and effective_from < payload.hire_date:
+                errors.append(
+                    {
+                        "row": row_number,
+                        "error": "Salary effective date cannot be before employee hire date",
+                    }
                 )
-                db.add(salary)
+                continue
 
-            _log_audit(
-                db,
-                user_id=current_user.id,
-                employee_id=employee.id,
-                salary_record_id=None,
-                action="employee_imported_csv",
-                details={"employee_code": employee.employee_code},
-                summary=f"Imported employee {employee.employee_code}",
-            )
-        except Exception as exc:
-            errors.append({"row": reader.line_num, "error": str(exc)})
+            if payload.employee_code in seen_codes:
+                errors.append(
+                    {"row": row_number, "error": "Duplicate employee code in CSV"}
+                )
+                continue
+            email = str(payload.email).casefold()
+            if email in seen_emails:
+                errors.append({"row": row_number, "error": "Duplicate email in CSV"})
+                continue
+            seen_codes.add(payload.employee_code)
+            seen_emails.add(email)
+            staged_rows.append((row_number, payload, effective_from))
+        except ValidationError as exc:
+            messages = [
+                f"{'.'.join(str(part) for part in issue['loc'])}: {issue['msg']}"
+                for issue in exc.errors()
+            ]
+            errors.append({"row": row_number, "error": "; ".join(messages)})
 
     if errors:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail={"errors": errors})
 
-    db.commit()
+    if not staged_rows:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="CSV file contains no employee rows",
+        )
+
+    employee_codes = [payload.employee_code for _, payload, _ in staged_rows]
+    emails = [str(payload.email) for _, payload, _ in staged_rows]
+    existing_employees = db.scalars(
+        select(Employee).where(
+            or_(
+                Employee.employee_code.in_(employee_codes),
+                Employee.email.in_(emails),
+            )
+        )
+    ).all()
+    employees_by_code = {employee.employee_code: employee for employee in existing_employees}
+    employees_by_email = {employee.email.casefold(): employee for employee in existing_employees}
+
+    for row_number, payload, effective_from in staged_rows:
+        employee_with_email = employees_by_email.get(str(payload.email).casefold())
+        employee_with_code = employees_by_code.get(payload.employee_code)
+        if employee_with_email and (
+            employee_with_code is None or employee_with_email.id != employee_with_code.id
+        ):
+            errors.append(
+                {"row": row_number, "error": "Email belongs to another employee"}
+            )
+
+    if errors:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail={"errors": errors})
+
+    salary_employee_ids = [
+        employees_by_code[payload.employee_code].id
+        for _, payload, _ in staged_rows
+        if payload.salary_amount is not None
+        and payload.employee_code in employees_by_code
+    ]
+    existing_salaries: dict[int, list[SalaryRecord]] = {}
+    if salary_employee_ids:
+        salary_records = db.scalars(
+            select(SalaryRecord)
+            .where(SalaryRecord.employee_id.in_(salary_employee_ids))
+            .order_by(SalaryRecord.employee_id, SalaryRecord.effective_from)
+        ).all()
+        for salary_record in salary_records:
+            existing_salaries.setdefault(salary_record.employee_id, []).append(salary_record)
+
+    for row_number, payload, effective_from in staged_rows:
+        employee = employees_by_code.get(payload.employee_code)
+        if employee is None or payload.salary_amount is None:
+            continue
+        for record in existing_salaries.get(employee.id, []):
+            if record.effective_from < effective_from and record.effective_to is None:
+                continue
+            if record.effective_from <= effective_from <= (record.effective_to or date.max):
+                errors.append(
+                    {
+                        "row": row_number,
+                        "error": "Salary period overlaps with an existing salary record",
+                    }
+                )
+                break
+            if record.effective_from > effective_from:
+                errors.append(
+                    {
+                        "row": row_number,
+                        "error": "Salary period overlaps with a later salary record",
+                    }
+                )
+                break
+
+    if errors:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail={"errors": errors})
+
+    inserted = 0
+    updated = 0
+    for _, payload, effective_from in staged_rows:
+        employee = employees_by_code.get(payload.employee_code)
+        employee_values = payload.model_dump(
+            exclude={
+                "salary_amount",
+                "salary_currency",
+                "salary_pay_frequency",
+                "salary_effective_from",
+            }
+        )
+        if employee is None:
+            employee = Employee(**employee_values)
+            db.add(employee)
+            db.flush()
+            employees_by_code[employee.employee_code] = employee
+            inserted += 1
+        else:
+            for field, value in employee_values.items():
+                setattr(employee, field, value)
+            updated += 1
+
+        salary_record = None
+        closed_periods = []
+        if payload.salary_amount is not None:
+            for previous in existing_salaries.get(employee.id, []):
+                if previous.effective_from < effective_from and previous.effective_to is None:
+                    previous.effective_to = effective_from - timedelta(days=1)
+                    closed_periods.append(previous.id)
+
+            salary_record = SalaryRecord(
+                employee_id=employee.id,
+                amount=payload.salary_amount,
+                currency=payload.salary_currency or "USD",
+                pay_frequency=payload.salary_pay_frequency,
+                effective_from=effective_from,
+            )
+            db.add(salary_record)
+            db.flush()
+
+        _log_audit(
+            db,
+            user_id=current_user.id,
+            employee_id=employee.id,
+            salary_record_id=salary_record.id if salary_record else None,
+            action="employee_imported_csv",
+            details={
+                "employee_code": employee.employee_code,
+                "closed_salary_record_ids": closed_periods,
+                "salary_amount": str(payload.salary_amount) if payload.salary_amount else None,
+            },
+            summary=f"Imported employee {employee.employee_code}",
+        )
+
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="CSV import conflicts with existing employee or salary records",
+        ) from exc
+
     return {"inserted": inserted, "updated": updated, "errors": []}
