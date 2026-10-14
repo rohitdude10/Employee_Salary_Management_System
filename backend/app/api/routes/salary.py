@@ -26,7 +26,7 @@ def _log_audit(db: Session, user_id: int | None, employee_id: int | None, salary
     db.add(audit)
 
 
-@router.get("/{employee_id}")
+@router.get("/{employee_id:int}")
 def get_salary_history(
     employee_id: int,
     db: Session = Depends(get_db),
@@ -59,7 +59,7 @@ def get_salary_history(
     }
 
 
-@router.post("/{employee_id}", response_model=SalaryRecordOut)
+@router.post("/{employee_id:int}", response_model=SalaryRecordOut)
 def create_salary_record(
     employee_id: int,
     payload: SalaryRecordCreate,
@@ -73,6 +73,8 @@ def create_salary_record(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Salary amount must be greater than zero")
     if payload.effective_from < employee.hire_date:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Effective date cannot be before hire date")
+    if payload.effective_to is not None and payload.effective_to < payload.effective_from:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Effective-to date cannot be before effective-from date")
 
     existing = (
         db.query(SalaryRecord)
@@ -81,17 +83,30 @@ def create_salary_record(
         .all()
     )
 
+    new_period_end = payload.effective_to or date.max
+    closed_periods = []
     for record in existing:
-        if record.effective_to is None:
-            record_end = date.max
-        else:
-            record_end = record.effective_to
-        if record.effective_from <= payload.effective_from <= record_end:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Salary period overlaps with an existing record")
+        record_period_end = record.effective_to or date.max
 
-    for record in existing:
-        if record.effective_from < payload.effective_from and (record.effective_to is None or record.effective_to >= payload.effective_from):
+        if (
+            record.effective_from < payload.effective_from
+            and record.effective_to is None
+        ):
+            closed_periods.append(
+                {
+                    "salary_record_id": record.id,
+                    "previous_effective_to": None,
+                    "effective_to": (payload.effective_from - timedelta(days=1)).isoformat(),
+                }
+            )
             record.effective_to = payload.effective_from - timedelta(days=1)
+            continue
+
+        if (
+            record.effective_from <= new_period_end
+            and payload.effective_from <= record_period_end
+        ):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Salary period overlaps with an existing record")
 
     new_record = SalaryRecord(
         employee_id=employee_id,
@@ -110,7 +125,12 @@ def create_salary_record(
         employee_id=employee_id,
         salary_record_id=new_record.id,
         action="salary_record_created",
-        details={"amount": str(payload.amount), "currency": payload.currency, "effective_from": payload.effective_from.isoformat()},
+        details={
+            "amount": str(payload.amount),
+            "currency": payload.currency,
+            "effective_from": payload.effective_from.isoformat(),
+            "closed_periods": closed_periods,
+        },
         summary=f"Created salary record for employee {employee.employee_code}",
     )
 

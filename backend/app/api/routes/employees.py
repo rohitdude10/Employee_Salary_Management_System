@@ -108,7 +108,7 @@ def list_employees(
     return payload
 
 
-@router.get("/{employee_id}", response_model=dict)
+@router.get("/{employee_id:int}", response_model=dict)
 def get_employee(
     employee_id: int,
     db: Session = Depends(get_db),
@@ -199,7 +199,7 @@ def create_employee(
     return _serialize_employee(employee, db)
 
 
-@router.put("/{employee_id}", response_model=EmployeeOut)
+@router.put("/{employee_id:int}", response_model=EmployeeOut)
 def update_employee(
     employee_id: int,
     payload: EmployeeUpdate,
@@ -248,7 +248,7 @@ def update_employee(
     return _serialize_employee(employee, db)
 
 
-@router.delete("/{employee_id}")
+@router.delete("/{employee_id:int}")
 def deactivate_employee(
     employee_id: int,
     db: Session = Depends(get_db),
@@ -275,10 +275,37 @@ def deactivate_employee(
 
 @router.get("/export-csv")
 def export_employees_csv(
+    search: str | None = None,
+    country: str | None = None,
+    department: str | None = None,
+    job_title: str | None = None,
+    status: str | None = None,
     db: Session = Depends(get_db),
     current_user: User = Depends(require_roles("hr_manager", "admin")),
 ):
-    employees = db.query(Employee).order_by(Employee.id).all()
+    statement = select(Employee)
+    if search:
+        term = f"%{search.strip()}%"
+        statement = statement.where(
+            or_(
+                Employee.first_name.ilike(term),
+                Employee.last_name.ilike(term),
+                Employee.employee_code.ilike(term),
+                Employee.email.ilike(term),
+                Employee.department.ilike(term),
+                Employee.job_title.ilike(term),
+            )
+        )
+    if country:
+        statement = statement.where(Employee.country == country)
+    if department:
+        statement = statement.where(Employee.department == department)
+    if job_title:
+        statement = statement.where(Employee.job_title == job_title)
+    if status:
+        statement = statement.where(Employee.status == status)
+
+    employees = db.scalars(statement.order_by(Employee.id)).all()
     output = io.StringIO()
     writer = csv.writer(output)
     writer.writerow([
