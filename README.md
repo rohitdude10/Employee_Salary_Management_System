@@ -16,6 +16,7 @@ ACME People & Pay is an HR application for managing employee profiles and salary
 - [CSV import format](#csv-import-format)
 - [Configuration](#configuration)
 - [Database and backups](#database-and-backups)
+- [Deploy for production](#deploy-for-production)
 - [Production considerations](#production-considerations)
 - [Troubleshooting](#troubleshooting)
 - [Project layout](#project-layout)
@@ -44,7 +45,7 @@ This application manages HR employee and compensation records; it is not a payro
 On Windows, install:
 
 - Python 3.11 (recommended; Python 3.10+ is needed for the syntax used).
-- Node.js and npm compatible with the installed Vite version.
+- Node.js `^20.19.0` or `>=22.12.0` and npm (required by the Vite 8 version in this project).
 - Git, if cloning the repository.
 
 Check the tools in PowerShell:
@@ -111,7 +112,7 @@ Open a **second** PowerShell terminal at the repository root:
 
 ```powershell
 Set-Location .\frontend
-npm install
+npm ci
 ```
 
 ## Seed the sample data
@@ -249,17 +250,143 @@ PowerShell environment variables set with `$env:NAME = "value"` apply only to th
 
 There is no production backup/restore automation or configurable database engine in this repository. Validate backups and recovery procedures before production use.
 
+## Deploy for production
+
+This section describes a provider-neutral deployment process. It is an operational checklist, not a platform-specific copy/paste recipe: configure networking, secrets, database, build pipeline, and monitoring using the chosen hosting provider’s supported services.
+
+### Production readiness: current code limitation
+
+**The repository is not deployable as a production system by configuration alone.** Before exposing it to real users or sensitive data, complete and test these application changes:
+
+1. **Make database configuration real.** `backend/app/database.py` currently constructs a SQLite engine at a fixed local path and ignores `DATABASE_URL`. Implement environment-driven database configuration, add the chosen production database driver, and test the application against that database.
+2. **Add and exercise schema migrations.** Tables are currently created with SQLAlchemy metadata on startup. Provide a checked-in migration configuration/history and a tested upgrade/rollback procedure before operating a persistent production database.
+3. **Use a persistent managed database.** Do not deploy the current SQLite file on ephemeral/container-local storage or share it across API instances. Restrict database network access to the backend.
+4. **Review transaction and concurrency behavior.** Exercise concurrent employee edits, salary changes, and CSV imports on the chosen database. Add database constraints or locking where needed to enforce salary-period invariants under concurrent requests.
+5. **Choose the frontend/API topology.** The Vite proxy is development-only. Production must configure the static frontend hosting and reverse proxy/API base path (or separate frontend/API origins) deliberately.
+6. **Add operational controls.** Define health/readiness checks, structured logs without sensitive data, metrics/alerts, backup and restore, retention, and incident procedures.
+
+Do not skip these items by merely setting `DATABASE_URL`: it currently has no effect. Until they are completed and validated, treat the project as a local development/demo application, not as fully production-ready software.
+
+### Recommended production topology
+
+Use a static frontend host or CDN for the built React assets, a managed backend application service for FastAPI, and a managed PostgreSQL database in a private network. Put HTTPS at a trusted load balancer/reverse proxy, and expose only the frontend and required API entry point to users.
+
+```text
+Browser --HTTPS--> Frontend host / CDN
+   |                    |
+   | same-origin /api   +--> static React build
+   v
+Trusted HTTPS proxy / load balancer
+   |
+   +--> FastAPI service --private connection--> Managed PostgreSQL
+```
+
+The diagram is a recommended target architecture, not an existing deployment configuration. Hosting products, DNS, proxy rules, database provisioning, and secrets management are environment-specific.
+
+### Deployment sequence
+
+#### 1. Prepare and validate the release
+
+- Select a hosting region, frontend/API topology, managed database, and backup/retention policy.
+- Pin and review dependency versions; build from a known source revision in CI.
+- Run the backend test suite from `backend` and frontend lint/build from `frontend`.
+- Add integration tests against the production database engine, including migrations and concurrent salary updates.
+- Produce and scan a deployable backend artifact/container and static frontend build. Do not include `.env` files, local SQLite databases, demo data, or credentials in artifacts.
+- Record the release revision and database migration version.
+
+#### 2. Provision the database
+
+- Provision the selected managed database with encryption and private network access.
+- Create a least-privilege application account; do not use a database owner/superuser credential for normal API traffic.
+- Configure the backend with a secret database connection string through the host’s secret manager.
+- Apply migrations as a controlled release step, before sending application traffic.
+- Enable automated backups and point-in-time recovery where available. Test restoring a backup to a separate instance.
+- Seed synthetic sample data only in non-production environments. Do not load demo or synthetic identities into a real production tenant unless explicitly intended.
+
+#### 3. Configure and deploy the backend
+
+Provide environment values through the hosting platform’s secret/configuration facility. Do not put secrets in source control or public build arguments.
+
+Required or relevant settings:
+
+| Setting | Production guidance |
+|---|---|
+| `APP_ENV` | Set to `production` |
+| `SECRET_KEY` | Generate a cryptographically random secret with at least 32 characters; keep stable across backend instances and restarts; define a controlled rotation plan |
+| `FRONTEND_ORIGIN` | Set to the exact trusted frontend origin. Current CORS configuration accepts one origin value |
+| `BOOTSTRAP_ADMIN_USERNAME` | Set only for initial production startup if no administrator exists |
+| `BOOTSTRAP_ADMIN_EMAIL` | Set only for initial production startup if no administrator exists |
+| `BOOTSTRAP_ADMIN_PASSWORD` | Initial password of at least 12 characters; use a unique strong secret and remove it from runtime configuration after bootstrap |
+| Database URL | The app must first be changed to consume the configured production database URL; current code ignores `DATABASE_URL` |
+
+Production startup deliberately does not create the local demo users. It requires a valid signing key and, while no administrator exists, the initial administrator settings. Verify this bootstrap path in a staging environment before production. Never use `admin123` or `hr123` in production.
+
+Run the backend with a production ASGI process configuration appropriate to the host (workers, concurrency, graceful shutdown, and health checks). Do not use Uvicorn `--reload` in production. Keep debug/error responses from exposing secrets or database details.
+
+#### 4. Build and deploy the frontend
+
+Build the static frontend in CI from `frontend`:
+
+```powershell
+Set-Location .\frontend
+npm ci
+npm run lint
+npm run build
+```
+
+Publish the generated `frontend\dist` directory to the selected static host/CDN. Vite’s configured proxy is only active for `npm run dev`; it does not proxy requests from the production static build.
+
+Choose one production request arrangement:
+
+- **Same origin (recommended):** Configure the trusted edge proxy to serve the static frontend and forward `/api/*` to FastAPI while removing the `/api` prefix, matching the current frontend API client’s default `/api` prefix. Forward `/health` only if it is intended to be publicly reachable.
+- **Separate origins:** Build with `VITE_API_URL` set to the absolute API base URL (without an extra `/api` path unless the API actually serves that prefix), configure the backend CORS origin to the exact frontend origin, and require HTTPS on both origins.
+
+`VITE_API_URL` is embedded into frontend build assets. Treat it as public configuration, not a secret. After changing it, rebuild and redeploy the frontend. Validate that frontend requests reach the intended API, not a development proxy or an unintended origin.
+
+#### 5. Bootstrap access and promote traffic
+
+- Start the backend against the migrated production database with the production signing secret.
+- Create the initial administrator through the controlled bootstrap environment settings.
+- Remove bootstrap password settings from the running service once an administrator exists.
+- Sign in as that administrator and create individual named HR accounts; do not share accounts.
+- Verify authorization for both allowed roles and confirm that an unauthorized role and an unauthenticated request are rejected.
+- Run smoke/acceptance checks in staging first. Promote traffic only after they pass.
+
+#### 6. Operate and recover
+
+- Monitor backend availability, error rates, latency, database health, disk/storage, and failed login patterns.
+- Alert on repeated 5xx responses, failed migrations, exhausted database connections, and backup failures.
+- Retain audit logs and backups according to an approved policy; restrict access to both.
+- Test restore and rollback procedures periodically. Application rollback must account for whether the new schema migration is backward compatible.
+- Rotate credentials and signing secrets using a planned procedure that considers active tokens and all running application instances.
+
+### Production acceptance checklist
+
+Before calling a deployment complete, verify each item in the target environment:
+
+- [ ] Frontend is served over HTTPS and the correct production API is configured.
+- [ ] `/health` and host-level readiness checks report healthy; backend startup fails safely on invalid production configuration.
+- [ ] Production database connectivity, migrations, persistence across restarts, and tested backup restore all work.
+- [ ] Initial admin bootstrap works once; demo accounts do not exist; HR users can be created by an admin.
+- [ ] Unauthenticated API requests return 401 and disallowed roles return 403.
+- [ ] Employee create, search/filter, pagination, edit, and deactivate workflows work through the deployed UI.
+- [ ] Salary changes preserve history, reject invalid/overlapping periods, and create audit records.
+- [ ] CSV import handles a valid UTF-8 file, reports invalid input without partial writes, and enforces the configured request-size limit.
+- [ ] Employee and salary CSV exports contain the expected filtered data and are treated as sensitive downloads.
+- [ ] Analytics match known test data and report compensation by currency without mixing currencies.
+- [ ] Logs/alerts, audit retention, backup schedule, restore drill, and incident owner are documented.
+- [ ] Security, privacy, accessibility, and applicable jurisdiction-specific reviews are complete.
+
+### Remaining production security considerations
+
+- The frontend currently stores bearer tokens in JavaScript-accessible local storage, which increases exposure if an XSS issue occurs. Consider a secure `HttpOnly`, `SameSite` cookie design with CSRF protection if appropriate to the deployment threat model.
+- The current API does not provide a token refresh or explicit revocation workflow; tokens expire after 24 hours. Define operational behavior for lost accounts, role changes, and signing-key rotation.
+- Ensure reverse-proxy upload limits are consistent with the backend 5 MiB CSV limit and reject oversized requests at the edge as well.
+- This README does not certify legal, payroll, privacy, or security compliance.
+
 ## Production considerations
 
-The local development instructions are not a production deployment recipe. Before a real deployment:
-
-1. Configure `APP_ENV=production` and a securely generated `SECRET_KEY` of at least 32 characters.
-2. On the first startup only, provide the three `BOOTSTRAP_ADMIN_*` variables. Use a unique, strong password of at least 12 characters. Production startup does not create the demo users; after an admin exists, bootstrap variables are no longer needed.
-3. Configure the exact trusted `FRONTEND_ORIGIN`. Terminate HTTPS at a properly configured trusted proxy and restrict network access to the API/database.
-4. Replace the fixed SQLite configuration with a managed database setup and migrations before running multiple API workers or instances.
-5. Add tested backups/restores, monitoring, audit-log retention, incident procedures, and deployment-specific upload/rate limits.
-6. Reassess browser token storage. The current UI uses JavaScript-accessible local storage, which is exposed if an XSS vulnerability occurs.
-7. Perform a security, privacy, and jurisdiction-specific compliance review. No legal or payroll-compliance certification is provided.
+The system currently has functional local-development workflows and hardening tests, but it is not yet a fully production-deployable system. Production readiness requires implementing and validating the database configuration/migrations and operational controls described above, in addition to selecting a hosting provider and completing the acceptance checklist.
 
 ## Troubleshooting
 
